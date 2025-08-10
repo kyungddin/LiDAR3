@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-# 250809 final + reflection (v33, Neighborhood Restoration, Full Code)
+# 250809 final + reflection (v16, The Final Reflection, Full Code)
+# 첫반사복원성공
 
 import rospy
 from sensor_msgs.msg import PointCloud2, PointField
@@ -25,16 +26,6 @@ last_front_face_normal = None
 last_switch_time = 0
 switch_interval = 3.0
 min_move_dist = 0.1
-
-RAY_FOV_H = 30.0
-RAY_FOV_V = 15.0
-RAY_GRID_W = 11
-RAY_GRID_H = 7
-MIN_REFLECTION_DISTANCE = 0.1
-MAX_REFLECTION_DISTANCE = 1.5
-
-# <<< TUNING: 히트 지점 주변을 탐색할 반경(radius)
-NEIGHBORHOOD_RADIUS = 0.3  # (meters) 10cm
 
 
 ######################################################################################################################
@@ -62,11 +53,18 @@ def o3d_to_pointcloud2(o3d_cloud, frame_id="ouster"):
     return pc2.create_cloud(header, fields, points)
 
 
-def reflect_point_cloud_across_plane(pcd, plane_center, plane_normal):
-    points = np.asarray(pcd.points)
-    dist_to_plane = np.dot(points - plane_center, plane_normal)
-    reflected_points = points - 2 * dist_to_plane[:, np.newaxis] * plane_normal
-    return o3d.geometry.PointCloud(o3d.utility.Vector3dVector(reflected_points))
+def reflect_point_cloud_across_plane(pcd_virtual, plane_center, plane_normal):
+    points_virtual = np.asarray(pcd_virtual.points)
+
+    # <<< MODIFIED: 벡터 방향을 수정하여 올바른 반사를 수행 >>>
+    # 가상 점에서 평면으로의 벡터를 계산
+    vec_to_plane = plane_center - points_virtual
+    # 평면 법선에 투영하여 거리 계산
+    dist_to_plane = np.dot(vec_to_plane, plane_normal)
+    # 실제 위치 = 가상 위치 + 2 * (가상 위치에서 평면까지의 벡터)
+    points_real = points_virtual + 2 * dist_to_plane[:, np.newaxis] * plane_normal
+
+    return o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points_real))
 
 
 def publish_cube(center, extent, frame_id, marker_id):
@@ -79,22 +77,13 @@ def publish_cube(center, extent, frame_id, marker_id):
 
 
 def publish_front_text(center, normal, frame_id):
+    # 법선 벡터는 센서를 향하도록 보정되었으므로, 텍스트를 살짝 앞으로 표시하려면 빼줘야 함
     front_pos = center - normal * 0.15
     marker = Marker(header=Header(stamp=rospy.Time.now(), frame_id=frame_id),
                     ns="front_text", id=9999, type=Marker.TEXT_VIEW_FACING, action=Marker.ADD,
                     pose=Pose(Point(*front_pos), Quaternion(0, 0, 0, 1)),
                     scale=Vector3(0, 0, 0.25), color=ColorRGBA(1.0, 0.0, 0.0, 1.0),
                     text="Front", lifetime=rospy.Duration(1))
-    marker_pub.publish(marker)
-
-
-def publish_ray_marker(start, end, hit, frame_id, marker_id):
-    marker = Marker(header=Header(stamp=rospy.Time.now(), frame_id=frame_id),
-                    ns="raycast", id=marker_id, type=Marker.ARROW, action=Marker.ADD,
-                    points=[Point(*start), Point(*end)],
-                    scale=Vector3(0.02, 0.04, 0),
-                    color=ColorRGBA(0.0, 1.0, 0.0, 0.8) if hit else ColorRGBA(1.0, 1.0, 0.0, 0.8),
-                    lifetime=rospy.Duration(0.5))
     marker_pub.publish(marker)
 
 
@@ -108,8 +97,8 @@ def callback(msg):
     # 1. 데이터 변환 및 전처리
     points = [p for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)]
     if not points: return
-    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(points)))
-    pcd = pcd.voxel_down_sample(voxel_size=0.005)
+    pcd_full = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(points)))
+    pcd = pcd_full.voxel_down_sample(voxel_size=0.005)
     cloud_pub.publish(o3d_to_pointcloud2(pcd, frame_id=msg.header.frame_id))
 
     # 2. 클러스터링 및 평면 후보 탐색
@@ -150,76 +139,28 @@ def callback(msg):
 
     if last_front_face_center is None: return
 
+    # RANSAC 법선 벡터 방향이 항상 센서를 향하도록 강제
     view_vector = last_front_face_center - np.array([0, 0, 0])
     if np.dot(last_front_face_normal, view_vector) > 0:
         last_front_face_normal = -last_front_face_normal
 
     publish_front_text(last_front_face_center, last_front_face_normal, msg.header.frame_id)
 
-    # 4. <<< MODIFIED: "레이캐스트에 맞은 점 주변 영역"을 반사시키는 최종 로직 >>>
+    # 4. 직접 반사 로직
+    all_points = np.asarray(pcd.points)
 
-    # 4-1. '가상 세계' 지도 생성 (거울 제외 모든 점)
-    other_points_indices = np.where(labels != closest_face_id)[0]
-    if len(other_points_indices) == 0: return
-    pcd_virtual_candidates = pcd.select_by_index(other_points_indices)
-    virtual_object_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd_virtual_candidates, 0.15)
+    # 평면 뒤에 있는 점들(가상 객체) 식별
+    # 법선 벡터는 센서를 향하므로, d < 0 인 점들이 거울 뒤 가상 공간에 있는 점들임
+    dists_from_plane = np.dot(all_points - last_front_face_center, last_front_face_normal)
+    virtual_point_indices = np.where(dists_from_plane < -0.05)[0]  # 5cm 이상 떨어진 점만
 
-    # 4-2. 레이캐스팅 발사
-    forward_vec, ray_origin = last_front_face_normal, last_front_face_center
-    global_up, right_vec, up_vec = np.array([0., 0., 1.]), None, None
-    right_vec = np.cross(global_up, forward_vec)
-    if np.linalg.norm(right_vec) < 1e-6: right_vec = np.cross(np.array([0., 1., 0.]), forward_vec)
-    right_vec /= np.linalg.norm(right_vec)
-    up_vec = np.cross(right_vec, -forward_vec)
-    ray_directions = []
-    for j in range(RAY_GRID_H):
-        theta_v = np.deg2rad(-RAY_FOV_V / 2 + j * (RAY_FOV_V / (RAY_GRID_H - 1))) if RAY_GRID_H > 1 else 0
-        for i in range(RAY_GRID_W):
-            theta_h = np.deg2rad(-RAY_FOV_H / 2 + i * (RAY_FOV_H / (RAY_GRID_W - 1))) if RAY_GRID_W > 1 else 0
-            rot_h, rot_v = o3d.geometry.get_rotation_matrix_from_axis_angle(
-                up_vec * theta_h), o3d.geometry.get_rotation_matrix_from_axis_angle(right_vec * theta_v)
-            ray_directions.append(rot_v @ rot_h @ -forward_vec)
+    if len(virtual_point_indices) > 0:
+        pcd_virtual = pcd.select_by_index(virtual_point_indices)
 
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(virtual_object_mesh))
-    rays_o3d = o3d.core.Tensor(np.hstack([np.tile(ray_origin, (len(ray_directions), 1)), ray_directions]),
-                               dtype=o3d.core.Dtype.Float32)
-    ans = scene.cast_rays(rays_o3d)
+        pcd_real = reflect_point_cloud_across_plane(pcd_virtual, last_front_face_center, last_front_face_normal)
 
-    # 4-3. 유효한 히트 지점 수집
-    hit_points = []
-    for i, t_tensor in enumerate(ans['t_hit']):
-        distance = t_tensor.item()
-        is_hit = np.isfinite(distance)
-        if is_hit and MIN_REFLECTION_DISTANCE < distance < MAX_REFLECTION_DISTANCE:
-            hit_points.append(ray_origin + ray_directions[i] * distance)
-
-        end_point = ray_origin + ray_directions[i] * distance if is_hit else ray_origin + ray_directions[i] * 5.0
-        publish_ray_marker(ray_origin, end_point, is_hit, msg.header.frame_id, 8000 + i)
-
-    # 4-4. 히트 지점 주변 영역 탐색 및 반사
-    if hit_points:
-        rospy.loginfo_throttle(1.0, f"SUCCESS! Found {len(hit_points)} virtual points. Searching neighborhood...")
-
-        # '가상 세계' 전체에 대한 KD-Tree를 한번만 생성
-        virtual_kdtree = o3d.geometry.KDTreeFlann(pcd_virtual_candidates)
-
-        # 모든 히트 지점 주변의 이웃 포인트 인덱스를 수집 (중복 제거를 위해 set 사용)
-        indices_to_reflect = set()
-        for hp in hit_points:
-            # 각 히트 지점마다 반경 내 이웃을 검색
-            [k, idx, _] = virtual_kdtree.search_radius_vector_3d(hp, NEIGHBORHOOD_RADIUS)
-            if k > 0:
-                indices_to_reflect.update(idx)
-
-        if indices_to_reflect:
-            # 최종적으로 선택된 '가상 포인트 클라우드' 영역
-            pcd_virtual_area = pcd_virtual_candidates.select_by_index(list(indices_to_reflect))
-
-            pcd_real = reflect_point_cloud_across_plane(pcd_virtual_area, last_front_face_center,
-                                                        last_front_face_normal)
-            pcd_real.paint_uniform_color([1.0, 0.0, 1.0])  # Magenta
-            reflected_pub.publish(o3d_to_pointcloud2(pcd_real, frame_id=msg.header.frame_id))
+        pcd_real.paint_uniform_color([1.0, 0.0, 1.0])  # Magenta
+        reflected_pub.publish(o3d_to_pointcloud2(pcd_real, frame_id=msg.header.frame_id))
 
 
 ######################################################################################################################
@@ -236,7 +177,7 @@ def main():
 
     rospy.Subscriber("/ouster/points", PointCloud2, callback, queue_size=1, buff_size=2 ** 24)
 
-    rospy.loginfo("Neighborhood Restoration Version of Mirror Reflection Node is Running.")
+    rospy.loginfo("The True Logic of Mirror Reflection Node is Running.")
     rospy.spin()
 
 

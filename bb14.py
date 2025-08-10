@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# 250809 final + reflection (v33, Neighborhood Restoration, Full Code)
+# 250809 final + reflection (v31, Final Tuning, Full Code)
 
 import rospy
 from sensor_msgs.msg import PointCloud2, PointField
@@ -26,15 +26,13 @@ last_switch_time = 0
 switch_interval = 3.0
 min_move_dist = 0.1
 
-RAY_FOV_H = 30.0
-RAY_FOV_V = 15.0
-RAY_GRID_W = 11
-RAY_GRID_H = 7
-MIN_REFLECTION_DISTANCE = 0.1
-MAX_REFLECTION_DISTANCE = 1.5
-
-# <<< TUNING: 히트 지점 주변을 탐색할 반경(radius)
-NEIGHBORHOOD_RADIUS = 0.3  # (meters) 10cm
+# <<< TUNING: 이 값을 조절하여 반사 영역을 제어하십시오 >>>
+RAY_FOV_H = 30.0  # (degrees) 수평 시야각 (범위를 넓힘)
+RAY_FOV_V = 15.0  # (degrees) 수직 시야각 (범위를 넓힘)
+RAY_GRID_W = 11  # 광선 밀도
+RAY_GRID_H = 7  # 광선 밀도
+MIN_REFLECTION_DISTANCE = 0.1  # (meters) 거울 표면 노이즈를 무시할 최소 거리
+MAX_REFLECTION_DISTANCE = 1.5  # (meters) 이 거리보다 멀리 있는 점은 반사시키지 않음
 
 
 ######################################################################################################################
@@ -156,15 +154,12 @@ def callback(msg):
 
     publish_front_text(last_front_face_center, last_front_face_normal, msg.header.frame_id)
 
-    # 4. <<< MODIFIED: "레이캐스트에 맞은 점 주변 영역"을 반사시키는 최종 로직 >>>
-
-    # 4-1. '가상 세계' 지도 생성 (거울 제외 모든 점)
+    # 4. "레이캐스트에 맞은 가까운 점들만" 반사시키는 최종 로직
     other_points_indices = np.where(labels != closest_face_id)[0]
     if len(other_points_indices) == 0: return
     pcd_virtual_candidates = pcd.select_by_index(other_points_indices)
     virtual_object_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd_virtual_candidates, 0.15)
 
-    # 4-2. 레이캐스팅 발사
     forward_vec, ray_origin = last_front_face_normal, last_front_face_center
     global_up, right_vec, up_vec = np.array([0., 0., 1.]), None, None
     right_vec = np.cross(global_up, forward_vec)
@@ -186,40 +181,24 @@ def callback(msg):
                                dtype=o3d.core.Dtype.Float32)
     ans = scene.cast_rays(rays_o3d)
 
-    # 4-3. 유효한 히트 지점 수집
     hit_points = []
     for i, t_tensor in enumerate(ans['t_hit']):
         distance = t_tensor.item()
         is_hit = np.isfinite(distance)
+
+        # <<< MODIFIED: 최소/최대 거리 필터링 추가 >>>
         if is_hit and MIN_REFLECTION_DISTANCE < distance < MAX_REFLECTION_DISTANCE:
             hit_points.append(ray_origin + ray_directions[i] * distance)
 
         end_point = ray_origin + ray_directions[i] * distance if is_hit else ray_origin + ray_directions[i] * 5.0
         publish_ray_marker(ray_origin, end_point, is_hit, msg.header.frame_id, 8000 + i)
 
-    # 4-4. 히트 지점 주변 영역 탐색 및 반사
     if hit_points:
-        rospy.loginfo_throttle(1.0, f"SUCCESS! Found {len(hit_points)} virtual points. Searching neighborhood...")
-
-        # '가상 세계' 전체에 대한 KD-Tree를 한번만 생성
-        virtual_kdtree = o3d.geometry.KDTreeFlann(pcd_virtual_candidates)
-
-        # 모든 히트 지점 주변의 이웃 포인트 인덱스를 수집 (중복 제거를 위해 set 사용)
-        indices_to_reflect = set()
-        for hp in hit_points:
-            # 각 히트 지점마다 반경 내 이웃을 검색
-            [k, idx, _] = virtual_kdtree.search_radius_vector_3d(hp, NEIGHBORHOOD_RADIUS)
-            if k > 0:
-                indices_to_reflect.update(idx)
-
-        if indices_to_reflect:
-            # 최종적으로 선택된 '가상 포인트 클라우드' 영역
-            pcd_virtual_area = pcd_virtual_candidates.select_by_index(list(indices_to_reflect))
-
-            pcd_real = reflect_point_cloud_across_plane(pcd_virtual_area, last_front_face_center,
-                                                        last_front_face_normal)
-            pcd_real.paint_uniform_color([1.0, 0.0, 1.0])  # Magenta
-            reflected_pub.publish(o3d_to_pointcloud2(pcd_real, frame_id=msg.header.frame_id))
+        rospy.loginfo_throttle(1.0, f"SUCCESS! Found {len(hit_points)} virtual points in range to reflect.")
+        pcd_virtual = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array(hit_points)))
+        pcd_real = reflect_point_cloud_across_plane(pcd_virtual, last_front_face_center, last_front_face_normal)
+        pcd_real.paint_uniform_color([1.0, 0.0, 1.0])
+        reflected_pub.publish(o3d_to_pointcloud2(pcd_real, frame_id=msg.header.frame_id))
 
 
 ######################################################################################################################
@@ -236,7 +215,7 @@ def main():
 
     rospy.Subscriber("/ouster/points", PointCloud2, callback, queue_size=1, buff_size=2 ** 24)
 
-    rospy.loginfo("Neighborhood Restoration Version of Mirror Reflection Node is Running.")
+    rospy.loginfo("The Final Tuned Version of Mirror Reflection Node is Running.")
     rospy.spin()
 
 

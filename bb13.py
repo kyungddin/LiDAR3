@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# 250809 final + reflection (v33, Neighborhood Restoration, Full Code)
+# 250809 final + reflection (v25, Sniper Scope Mode, Full Code)
 
 import rospy
 from sensor_msgs.msg import PointCloud2, PointField
@@ -26,15 +26,12 @@ last_switch_time = 0
 switch_interval = 3.0
 min_move_dist = 0.1
 
-RAY_FOV_H = 30.0
-RAY_FOV_V = 15.0
-RAY_GRID_W = 11
-RAY_GRID_H = 7
+# <<< TUNING: 이 값을 조절하여 반사 영역을 제어하십시오 >>>
+RAY_FOV_H = 15.0  # (degrees) 수평 시야각 (값을 줄여 정밀 조준)
+RAY_FOV_V = 5.0  # (degrees) 수직 시야각 (값을 줄여 정밀 조준)
+RAY_GRID_W = 7
+RAY_GRID_H = 3
 MIN_REFLECTION_DISTANCE = 0.1
-MAX_REFLECTION_DISTANCE = 1.5
-
-# <<< TUNING: 히트 지점 주변을 탐색할 반경(radius)
-NEIGHBORHOOD_RADIUS = 0.3  # (meters) 10cm
 
 
 ######################################################################################################################
@@ -116,7 +113,7 @@ def callback(msg):
     labels = np.array(pcd.cluster_dbscan(eps=0.05, min_points=30, print_progress=False))
     if labels.max() < 0: return
 
-    candidate_faces = []
+    candidate_faces, clusters = [], {}
     for i in range(labels.max() + 1):
         cluster_indices = np.where(labels == i)[0]
         if len(cluster_indices) < 100: continue
@@ -133,6 +130,7 @@ def callback(msg):
         if len(inlier_cloud.crop(center_box).points) > 10: continue
 
         publish_cube(center, extent, msg.header.frame_id, i)
+        clusters[i] = cluster_pcd
         normal = np.array(plane_model[:3]) / np.linalg.norm(plane_model[:3])
         candidate_faces.append({'id': i, 'center': center, 'normal': normal, 'area': extent[0] * extent[1]})
 
@@ -156,15 +154,16 @@ def callback(msg):
 
     publish_front_text(last_front_face_center, last_front_face_normal, msg.header.frame_id)
 
-    # 4. <<< MODIFIED: "레이캐스트에 맞은 점 주변 영역"을 반사시키는 최종 로직 >>>
+    # 4. <<< MODIFIED: 레이캐스팅 기반 정밀 반사 로직 >>>
 
-    # 4-1. '가상 세계' 지도 생성 (거울 제외 모든 점)
+    # 4-1. '외부 세계' 지도 생성
     other_points_indices = np.where(labels != closest_face_id)[0]
     if len(other_points_indices) == 0: return
-    pcd_virtual_candidates = pcd.select_by_index(other_points_indices)
-    virtual_object_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd_virtual_candidates, 0.15)
+    other_pcd = pcd.select_by_index(other_points_indices)
+    other_pcd_labels = labels[other_points_indices]
+    virtual_object_mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(other_pcd, 0.15)
 
-    # 4-2. 레이캐스팅 발사
+    # 4-2. 좁아진 시야각으로 레이캐스팅 발사
     forward_vec, ray_origin = last_front_face_normal, last_front_face_center
     global_up, right_vec, up_vec = np.array([0., 0., 1.]), None, None
     right_vec = np.cross(global_up, forward_vec)
@@ -186,38 +185,31 @@ def callback(msg):
                                dtype=o3d.core.Dtype.Float32)
     ans = scene.cast_rays(rays_o3d)
 
-    # 4-3. 유효한 히트 지점 수집
-    hit_points = []
-    for i, t_tensor in enumerate(ans['t_hit']):
-        distance = t_tensor.item()
-        is_hit = np.isfinite(distance)
-        if is_hit and MIN_REFLECTION_DISTANCE < distance < MAX_REFLECTION_DISTANCE:
-            hit_points.append(ray_origin + ray_directions[i] * distance)
+    # 4-3. 표적 식별 및 반사
+    hit_cluster_ids = set()
+    hit_triangle_indices = ans['primitive_ids'].numpy()
+    hit_distances = ans['t_hit'].numpy()
+    mesh_triangles = np.asarray(virtual_object_mesh.triangles)
+
+    for i in range(len(ray_directions)):
+        tri_idx, distance = hit_triangle_indices[i], hit_distances[i]
+        is_hit = np.isfinite(distance) and tri_idx != o3d.t.geometry.RaycastingScene.INVALID_ID
+
+        if is_hit and distance > MIN_REFLECTION_DISTANCE:
+            vertex_indices = mesh_triangles[tri_idx]
+            for v_idx in vertex_indices:
+                cluster_label = other_pcd_labels[v_idx]
+                if cluster_label != -1:
+                    hit_cluster_ids.add(cluster_label)
 
         end_point = ray_origin + ray_directions[i] * distance if is_hit else ray_origin + ray_directions[i] * 5.0
         publish_ray_marker(ray_origin, end_point, is_hit, msg.header.frame_id, 8000 + i)
 
-    # 4-4. 히트 지점 주변 영역 탐색 및 반사
-    if hit_points:
-        rospy.loginfo_throttle(1.0, f"SUCCESS! Found {len(hit_points)} virtual points. Searching neighborhood...")
-
-        # '가상 세계' 전체에 대한 KD-Tree를 한번만 생성
-        virtual_kdtree = o3d.geometry.KDTreeFlann(pcd_virtual_candidates)
-
-        # 모든 히트 지점 주변의 이웃 포인트 인덱스를 수집 (중복 제거를 위해 set 사용)
-        indices_to_reflect = set()
-        for hp in hit_points:
-            # 각 히트 지점마다 반경 내 이웃을 검색
-            [k, idx, _] = virtual_kdtree.search_radius_vector_3d(hp, NEIGHBORHOOD_RADIUS)
-            if k > 0:
-                indices_to_reflect.update(idx)
-
-        if indices_to_reflect:
-            # 최종적으로 선택된 '가상 포인트 클라우드' 영역
-            pcd_virtual_area = pcd_virtual_candidates.select_by_index(list(indices_to_reflect))
-
-            pcd_real = reflect_point_cloud_across_plane(pcd_virtual_area, last_front_face_center,
-                                                        last_front_face_normal)
+    if hit_cluster_ids:
+        rospy.loginfo(f"SUCCESS! Reflecting virtual clusters: {hit_cluster_ids}")
+        for cluster_id in hit_cluster_ids:
+            pcd_virtual = pcd.select_by_index(np.where(labels == cluster_id)[0])
+            pcd_real = reflect_point_cloud_across_plane(pcd_virtual, last_front_face_center, last_front_face_normal)
             pcd_real.paint_uniform_color([1.0, 0.0, 1.0])  # Magenta
             reflected_pub.publish(o3d_to_pointcloud2(pcd_real, frame_id=msg.header.frame_id))
 
@@ -236,7 +228,7 @@ def main():
 
     rospy.Subscriber("/ouster/points", PointCloud2, callback, queue_size=1, buff_size=2 ** 24)
 
-    rospy.loginfo("Neighborhood Restoration Version of Mirror Reflection Node is Running.")
+    rospy.loginfo("Sniper Scope Mode of Mirror Reflection Node is Running.")
     rospy.spin()
 
 
