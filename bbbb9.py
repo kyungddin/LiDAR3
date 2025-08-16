@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# 거울 탐지 알고리즘 (v3.59 - Culling Bug Fix)
+# 거울 탐지 알고리즘 (v3.56 - Refined Publishing)
 
 import rospy
 from sensor_msgs.msg import PointCloud2, PointField
@@ -45,34 +45,29 @@ CULLING_DISTANCE_FROM_MIRROR = 0.2
 
 
 def o3d_to_pointcloud2(o3d_cloud, frame_id="ouster"):
+    # ... (Unchanged)
     points = np.asarray(o3d_cloud.points)
     header = rospy.Header()
     header.stamp = rospy.Time.now()
     header.frame_id = frame_id
-
     fields = [
         PointField('x', 0, PointField.FLOAT32, 1),
         PointField('y', 4, PointField.FLOAT32, 1),
-        PointField('z', 8, PointField.FLOAT32, 1),
-        PointField('rgb', 12, PointField.UINT32, 1)
+        PointField('z', 8, PointField.FLOAT32, 1)
     ]
-
-    packed_points = np.zeros(len(points), dtype=[
-        ('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)
-    ])
-    packed_points['x'], packed_points['y'], packed_points['z'] = points[:, 0], points[:, 1], points[:, 2]
-
     if o3d_cloud.has_colors():
         colors = (np.asarray(o3d_cloud.colors) * 255).astype(np.uint8)
         rgb_int = (colors[:, 0].astype(np.uint32) << 16) | \
                   (colors[:, 1].astype(np.uint32) << 8) | \
                   (colors[:, 2].astype(np.uint32))
+        packed_points = np.zeros(len(points), dtype=[
+            ('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)
+        ])
+        packed_points['x'], packed_points['y'], packed_points['z'] = points[:, 0], points[:, 1], points[:, 2]
         packed_points['rgb'] = rgb_int.view(np.uint32)
-    else:
-        white_rgb = (255 << 16) | (255 << 8) | 255
-        packed_points['rgb'] = white_rgb
-
-    return pc2.create_cloud(header, fields, packed_points)
+        fields.append(PointField('rgb', 12, PointField.UINT32, 1))
+        return pc2.create_cloud(header, fields, packed_points)
+    return pc2.create_cloud(header, fields, points)
 
 
 def publish_cube(center, extent, orientation_q, frame_id="ouster", marker_id=0, normal_vector=None):
@@ -153,7 +148,6 @@ def publish_search_boxes(search_obbs, frame_id="ouster"):
 
 
 def callback_points1(msg):
-    # ... (Unchanged)
     global pcd1_global
     points = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)))
     if points.shape[0] == 0: return
@@ -334,18 +328,14 @@ def process_mirror_detection(frame_id):
             for index in initial_indices:
                 [k, idx, _] = pcd_tree.search_radius_vector_3d(pcd1_global.points[index], search_radius)
                 neighbor_indices.extend(idx)
-            candidate_indices = np.unique(np.concatenate((initial_indices, neighbor_indices)))
-            candidate_points = np.asarray(pcd1_global.select_by_index(candidate_indices).points)
+            final_indices_to_restore = np.unique(np.concatenate((initial_indices, neighbor_indices)))
+            points_to_restore = np.asarray(pcd1_global.select_by_index(final_indices_to_restore).points)
 
-            keep_mask = np.ones(len(candidate_points), dtype=bool)
-            if CULLING_DISTANCE_FROM_MIRROR > 0.0:
+            if CULLING_DISTANCE_FROM_MIRROR > 0.0 and len(points_to_restore) > 0:
                 plane_center = state["center"]
                 plane_normal = mirror_z_axis
-                distances = np.dot(candidate_points - plane_center, plane_normal)
-                keep_mask = distances > CULLING_DISTANCE_FROM_MIRROR
-
-            final_indices_to_process = candidate_indices[keep_mask]
-            points_to_restore = candidate_points[keep_mask]
+                distances = np.dot(points_to_restore - plane_center, plane_normal)
+                points_to_restore = points_to_restore[distances > CULLING_DISTANCE_FROM_MIRROR]
 
             if len(points_to_restore) > 0:
                 frames_since_restoration = 0
@@ -365,10 +355,10 @@ def process_mirror_detection(frame_id):
                     restored_coords[:, 2] += z_correction
 
                 restored_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(restored_coords))
-                restored_pcd.paint_uniform_color([0, 0, 1])
+                restored_pcd.paint_uniform_color([1, 0, 1])
                 last_restored_pcd = restored_pcd
 
-                pcd1_cleaned = pcd1_global.select_by_index(final_indices_to_process, invert=True)
+                pcd1_cleaned = pcd1_global.select_by_index(final_indices_to_restore, invert=True)
                 final_pcd = pcd1_cleaned + restored_pcd
                 final_pcd_to_publish = final_pcd.voxel_down_sample(voxel_size=0.05)
             else:
@@ -409,7 +399,7 @@ def main():
     denoised_points2_pub = rospy.Publisher('/points2_denoised', PointCloud2, queue_size=2)
     restored_points_pub = rospy.Publisher('/restored_points', PointCloud2, queue_size=2)
     final_cloud_pub = rospy.Publisher('/final_cloud', PointCloud2, queue_size=2)
-    rospy.loginfo("▶ 거울 탐지 및 복원 노드 시작 (v3.59 - Culling Bug Fix)")
+    rospy.loginfo("▶ 거울 탐지 및 복원 노드 시작 (v3.56 - Refined Publishing)")
     rospy.spin()
 
 

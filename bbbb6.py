@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# 거울 탐지 알고리즘 (v3.59 - Culling Bug Fix)
+# 거울 탐지 알고리즘 (v3.51 - PCA Planarity Check)
 
 import rospy
 from sensor_msgs.msg import PointCloud2, PointField
@@ -19,17 +19,13 @@ cloud_pub = None
 points2_pub = None
 denoised_points2_pub = None
 restored_points_pub = None
-final_cloud_pub = None
 last_points2 = None
 pcd1_global = None
 points_lock = Lock()
 last_mirror_state = None
 frames_since_detection = 0
-last_restored_pcd = None
-frames_since_restoration = 0
 
 # --- 스무딩 파라미터 ---
-RESTORATION_TTL = 10
 DETECTION_TTL = 20
 SMOOTHING_FACTOR = 0.15
 # --- 게이트(Gate) 파라미터 ---
@@ -39,40 +35,34 @@ MAX_ROTATIONAL_VELOCITY_DEG = 15.0
 MANUAL_YAW_CORRECTION_DEGREES = 0.0
 MAX_PLANE_THICKNESS = 0.1
 
-# --- ▼▼▼ 추가/수정된 파라미터 ▼▼▼ ---
-Z_CORRECTION_FACTOR = 1.2
-CULLING_DISTANCE_FROM_MIRROR = 0.2
+# --- ▼▼▼ 추가된 파라미터 ▼▼▼ ---
+Z_CORRECTION_FACTOR = 1.2  # z축 기울기에 기반한 보정 강도. 0으로 두면 비활성화됩니다.
 
 
 def o3d_to_pointcloud2(o3d_cloud, frame_id="ouster"):
+    # ... (Unchanged)
     points = np.asarray(o3d_cloud.points)
     header = rospy.Header()
     header.stamp = rospy.Time.now()
     header.frame_id = frame_id
-
     fields = [
         PointField('x', 0, PointField.FLOAT32, 1),
         PointField('y', 4, PointField.FLOAT32, 1),
-        PointField('z', 8, PointField.FLOAT32, 1),
-        PointField('rgb', 12, PointField.UINT32, 1)
+        PointField('z', 8, PointField.FLOAT32, 1)
     ]
-
-    packed_points = np.zeros(len(points), dtype=[
-        ('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)
-    ])
-    packed_points['x'], packed_points['y'], packed_points['z'] = points[:, 0], points[:, 1], points[:, 2]
-
     if o3d_cloud.has_colors():
         colors = (np.asarray(o3d_cloud.colors) * 255).astype(np.uint8)
         rgb_int = (colors[:, 0].astype(np.uint32) << 16) | \
                   (colors[:, 1].astype(np.uint32) << 8) | \
                   (colors[:, 2].astype(np.uint32))
+        packed_points = np.zeros(len(points), dtype=[
+            ('x', np.float32), ('y', np.float32), ('z', np.float32), ('rgb', np.uint32)
+        ])
+        packed_points['x'], packed_points['y'], packed_points['z'] = points[:, 0], points[:, 1], points[:, 2]
         packed_points['rgb'] = rgb_int.view(np.uint32)
-    else:
-        white_rgb = (255 << 16) | (255 << 8) | 255
-        packed_points['rgb'] = white_rgb
-
-    return pc2.create_cloud(header, fields, packed_points)
+        fields.append(PointField('rgb', 12, PointField.UINT32, 1))
+        return pc2.create_cloud(header, fields, packed_points)
+    return pc2.create_cloud(header, fields, points)
 
 
 def publish_cube(center, extent, orientation_q, frame_id="ouster", marker_id=0, normal_vector=None):
@@ -173,7 +163,7 @@ def callback_points2(msg):
 
 
 def process_mirror_detection(frame_id):
-    global last_mirror_state, frames_since_detection, last_restored_pcd, frames_since_restoration
+    global last_mirror_state, frames_since_detection
 
     with points_lock:
         if last_points2 is None or pcd1_global is None or len(last_points2) == 0: return
@@ -183,7 +173,7 @@ def process_mirror_detection(frame_id):
 
     mirror_found_in_this_frame = False
 
-    labels = np.array(pcd2.cluster_dbscan(eps=0.15, min_points=70, print_progress=False))
+    labels = np.array(pcd2.cluster_dbscan(eps=0.15, min_points=100, print_progress=False))
     unique_labels = np.unique(labels[labels != -1])
 
     if len(unique_labels) > 0:
@@ -196,6 +186,7 @@ def process_mirror_detection(frame_id):
             cluster_indices = np.where(labels == label)[0]
             cluster_pcd = pcd2.select_by_index(cluster_indices)
 
+            ### ▼▼▼ PCA 기반 평면성(Planarity) 검사 로직 추가 ▼▼▼ ###
             points = np.asarray(cluster_pcd.points)
             if len(points) < 50:
                 continue
@@ -203,15 +194,24 @@ def process_mirror_detection(frame_id):
             mean = np.mean(points, axis=0)
             cov_matrix = np.cov(points - mean, rowvar=False)
             eigenvalues, _ = np.linalg.eig(cov_matrix)
+
             sorted_eigenvalues = np.sort(eigenvalues)
+
+            # 고유값의 합이 0에 가까운 경우(포인트가 한 점에 몰린 경우) 분모 0 에러 방지
             sum_eigenvalues = np.sum(sorted_eigenvalues)
             if sum_eigenvalues < 1e-6:
                 continue
+
             planarity = sorted_eigenvalues[0] / sum_eigenvalues
+
+            # 평면성 임계값 검사: 이 값이 0.02보다 크면 두꺼운 덩어리로 판단
             if planarity > 0.02:
                 continue
+            ### ▲▲▲ 평면성 검사 로직 끝 ▲▲▲ ###
 
+            # 평면성이 검증된 클러스터에 대해서만 RANSAC 수행 (distance_threshold 수정)
             plane_model, inliers = cluster_pcd.segment_plane(distance_threshold=0.02, ransac_n=3, num_iterations=1000)
+
             if len(inliers) < 15: continue
 
             mirror_candidate_pcd = cluster_pcd.select_by_index(inliers)
@@ -255,22 +255,27 @@ def process_mirror_detection(frame_id):
                                      "rotation": Rotation.from_matrix(rotation_matrix), "plane_model": plane_model}
             else:
                 dist_diff = np.linalg.norm(center - last_mirror_state["center"])
+
                 last_rot = last_mirror_state["rotation"]
                 current_rot = Rotation.from_matrix(rotation_matrix)
                 angular_diff = (last_rot.inv() * current_rot).as_rotvec()
                 angle_diff_deg = np.linalg.norm(angular_diff) * 180 / np.pi
+
                 if dist_diff > MAX_TRANSLATIONAL_VELOCITY or angle_diff_deg > MAX_ROTATIONAL_VELOCITY_DEG:
                     rospy.logwarn(
                         f"Outlier detected. Ignoring update. Dist: {dist_diff:.2f}m, Angle: {angle_diff_deg:.2f}deg")
                     mirror_found_in_this_frame = False
                     break
+
                 alpha = SMOOTHING_FACTOR
                 last_mirror_state["center"] = alpha * center + (1 - alpha) * last_mirror_state["center"]
                 last_mirror_state["extent"] = alpha * extent + (1 - alpha) * last_mirror_state["extent"]
                 last_mirror_state["plane_model"] = alpha * plane_model + (1 - alpha) * last_mirror_state["plane_model"]
+
                 key_rotations = Rotation.from_matrix([last_mirror_state["rotation"].as_matrix(), rotation_matrix])
                 slerp = Slerp([0, 1], key_rotations)
                 last_mirror_state["rotation"] = slerp([alpha])[0]
+
             break
 
     if not mirror_found_in_this_frame:
@@ -294,16 +299,22 @@ def process_mirror_detection(frame_id):
 
         vec_for_yaw = center / (np.linalg.norm(center) + np.finfo(float).eps)
         vec_for_pitch = mirror_z_axis
+
         yaw_horiz_direction = np.array([vec_for_yaw[0], vec_for_yaw[1], 0.0])
         yaw_horiz_direction /= (np.linalg.norm(yaw_horiz_direction) + np.finfo(float).eps)
+
         pitch_horiz_magnitude = np.sqrt(vec_for_pitch[0] ** 2 + vec_for_pitch[1] ** 2)
         pitch_vert_magnitude = vec_for_pitch[2]
+
         final_z_axis = yaw_horiz_direction * pitch_horiz_magnitude + np.array([0, 0, pitch_vert_magnitude])
         final_z_axis /= (np.linalg.norm(final_z_axis) + np.finfo(float).eps)
-        final_x_axis = np.cross(mirror_y_axis, final_z_axis);
+
+        final_x_axis = np.cross(mirror_y_axis, final_z_axis)
         final_x_axis /= (np.linalg.norm(final_x_axis) + np.finfo(float).eps)
-        final_y_axis = np.cross(final_z_axis, final_x_axis);
+
+        final_y_axis = np.cross(final_z_axis, final_x_axis)
         final_y_axis /= (np.linalg.norm(final_y_axis) + np.finfo(float).eps)
+
         search_box_rotation_matrix = np.stack([final_x_axis, final_y_axis, final_z_axis], axis=1)
 
         search_obbs = []
@@ -312,14 +323,15 @@ def process_mirror_detection(frame_id):
         height_reduction_factor = 1.5
         base_width_scale = 1.5
         width_scale_increment = 0.6
+
         for i in range(num_boxes):
             box_center = center + final_z_axis * (step_distance * i + (step_distance / 2.0))
             size_multiplier = base_width_scale + (width_scale_increment * i)
             box_extent = np.array([extent[0] * height_reduction_factor, extent[1] * size_multiplier, step_distance])
-            search_obbs.append(o3d.geometry.OrientedBoundingBox(box_center, search_box_rotation_matrix, box_extent))
-        publish_search_boxes(search_obbs, frame_id)
 
-        final_pcd_to_publish = pcd1_global.voxel_down_sample(voxel_size=0.05)
+            search_obbs.append(o3d.geometry.OrientedBoundingBox(box_center, search_box_rotation_matrix, box_extent))
+
+        publish_search_boxes(search_obbs, frame_id)
 
         reflected_indices = []
         for obb in search_obbs:
@@ -334,72 +346,45 @@ def process_mirror_detection(frame_id):
             for index in initial_indices:
                 [k, idx, _] = pcd_tree.search_radius_vector_3d(pcd1_global.points[index], search_radius)
                 neighbor_indices.extend(idx)
-            candidate_indices = np.unique(np.concatenate((initial_indices, neighbor_indices)))
-            candidate_points = np.asarray(pcd1_global.select_by_index(candidate_indices).points)
+            final_indices_to_restore = np.unique(np.concatenate((initial_indices, neighbor_indices)))
+            points_to_restore = np.asarray(pcd1_global.select_by_index(final_indices_to_restore).points)
 
-            keep_mask = np.ones(len(candidate_points), dtype=bool)
-            if CULLING_DISTANCE_FROM_MIRROR > 0.0:
-                plane_center = state["center"]
-                plane_normal = mirror_z_axis
-                distances = np.dot(candidate_points - plane_center, plane_normal)
-                keep_mask = distances > CULLING_DISTANCE_FROM_MIRROR
+            ### ▼▼▼ 하우스홀더 변환 기반 반사 로직으로 복구 ▼▼▼ ###
+            estimated_glass_thickness = 0.005
+            reflection_plane_center = center + mirror_z_axis * estimated_glass_thickness
 
-            final_indices_to_process = candidate_indices[keep_mask]
-            points_to_restore = candidate_points[keep_mask]
+            n = mirror_z_axis
+            Q = reflection_plane_center
 
-            if len(points_to_restore) > 0:
-                frames_since_restoration = 0
-                estimated_glass_thickness = 0.005
-                reflection_plane_center = center + mirror_z_axis * estimated_glass_thickness
-                n = mirror_z_axis
-                Q = reflection_plane_center
-                n_col = n.reshape(3, 1)
-                reflection_matrix = np.identity(3) - 2 * (n_col @ n_col.T)
-                points_translated = points_to_restore - Q
-                points_reflected_translated = points_translated @ reflection_matrix.T
-                restored_coords = points_reflected_translated + Q
+            n_col = n.reshape(3, 1)
+            reflection_matrix = np.identity(3) - 2 * (n_col @ n_col.T)
+            points_translated = points_to_restore - Q
+            points_reflected_translated = points_translated @ reflection_matrix.T
+            restored_coords = points_reflected_translated + Q
+            ### ▲▲▲ 하우스홀더 변환 기반 반사 로직으로 복구 ▲▲▲ ###
 
-                if Z_CORRECTION_FACTOR != 0.0:
-                    mirror_z_slope = mirror_z_axis[2]
-                    z_correction = -mirror_z_slope * Z_CORRECTION_FACTOR
-                    restored_coords[:, 2] += z_correction
+            ### ▼▼▼ 추가된 각도 보정 로직 ▼▼▼ ###
+            if Z_CORRECTION_FACTOR != 0.0:
+                mirror_z_slope = mirror_z_axis[2]
+                z_correction = -mirror_z_slope * Z_CORRECTION_FACTOR
+                restored_coords[:, 2] += z_correction
+            ### ▲▲▲ 추가된 로직 끝 ▲▲▲ ###
 
-                restored_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(restored_coords))
-                restored_pcd.paint_uniform_color([0, 0, 1])
-                last_restored_pcd = restored_pcd
-
-                pcd1_cleaned = pcd1_global.select_by_index(final_indices_to_process, invert=True)
-                final_pcd = pcd1_cleaned + restored_pcd
-                final_pcd_to_publish = final_pcd.voxel_down_sample(voxel_size=0.05)
-            else:
-                frames_since_restoration += 1
+            restored_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(restored_coords))
+            restored_pcd.paint_uniform_color([1, 0, 1])
+            restored_points_pub.publish(o3d_to_pointcloud2(restored_pcd, frame_id))
         else:
-            frames_since_restoration += 1
-
-        if frames_since_restoration < RESTORATION_TTL and last_restored_pcd is not None:
-            restored_points_pub.publish(o3d_to_pointcloud2(last_restored_pcd, frame_id))
-        else:
-            restored_points_pub.publish(o3d_to_pointcloud2(o3d.geometry.PointCloud(), frame_id))
-
-        if final_cloud_pub:
-            final_cloud_pub.publish(o3d_to_pointcloud2(final_pcd_to_publish, frame_id))
-
+            pass
     else:
         if frames_since_detection >= DETECTION_TTL:
             last_mirror_state = None
             clear_all_markers()
             denoised_points2_pub.publish(o3d_to_pointcloud2(o3d.geometry.PointCloud(), frame_id))
-            if last_restored_pcd is not None:
-                last_restored_pcd = None
-                restored_points_pub.publish(o3d_to_pointcloud2(o3d.geometry.PointCloud(), frame_id))
-
-        if final_cloud_pub:
-            pcd1_down = pcd1_global.voxel_down_sample(voxel_size=0.05)
-            final_cloud_pub.publish(o3d_to_pointcloud2(pcd1_down, frame_id))
 
 
 def main():
-    global marker_pub, cloud_pub, points2_pub, denoised_points2_pub, restored_points_pub, final_cloud_pub
+    # ... (Unchanged)
+    global marker_pub, cloud_pub, points2_pub, denoised_points2_pub, restored_points_pub
     rospy.init_node('mirror_detector_node', anonymous=True)
     rospy.Subscriber('/ouster/points', PointCloud2, callback_points1, queue_size=1, buff_size=2 ** 24)
     rospy.Subscriber('/ouster/points2', PointCloud2, callback_points2, queue_size=1, buff_size=2 ** 24)
@@ -408,8 +393,7 @@ def main():
     points2_pub = rospy.Publisher('/republished_points2', PointCloud2, queue_size=2)
     denoised_points2_pub = rospy.Publisher('/points2_denoised', PointCloud2, queue_size=2)
     restored_points_pub = rospy.Publisher('/restored_points', PointCloud2, queue_size=2)
-    final_cloud_pub = rospy.Publisher('/final_cloud', PointCloud2, queue_size=2)
-    rospy.loginfo("▶ 거울 탐지 및 복원 노드 시작 (v3.59 - Culling Bug Fix)")
+    rospy.loginfo("▶ 거울 탐지 및 복원 노드 시작 (v3.51 - PCA Planarity Check)")
     rospy.spin()
 
 
